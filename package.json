@@ -4,10 +4,10 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"build": "vite build",
+		"build": "wrangler types && vite build",
 		"deploy": "npm run build && wrangler deploy",
-		"dev": "wrangler dev",
-		"start": "wrangler dev",
+		"dev": "wrangler types && wrangler dev",
+		"start": "wrangler types && wrangler dev",
 		"test": "vitest",
 		"cf-typegen": "wrangler types"
 	},
