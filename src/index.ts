@@ -6,15 +6,25 @@ import { cors } from 'hono/cors';
 interface Env {
   DB: D1Database;
   AI: Ai;
-  EMAIL_SENDER: SendEmail; // Binding for sending
+  EMAIL_SENDER: SendEmail;
   ASSETS: Fetcher;
+  QUEUE: Queue;
+  VECTOR_INDEX: VectorizeIndex;
+  MAIL_STORAGE: R2Bucket;
+}
+
+interface EmailJob {
+  id: string;
+  raw: string; // Base64 encoded
+  from: string;
+  to: string;
 }
 
 const app = new Hono<{ Bindings: Env }>();
 
 app.use('/api/*', cors());
 
-// --- 1. API ROUTES (Frontend Communication) ---
+// --- 1. API ROUTES ---
 
 // Get Inbox
 app.get('/api/emails', async (c) => {
@@ -28,27 +38,63 @@ app.get('/api/emails', async (c) => {
 // Get Single Email
 app.get('/api/emails/:id', async (c) => {
   const id = c.req.param('id');
-  const email = await c.env.DB.prepare('SELECT * FROM emails WHERE id = ?').bind(id).first();
   
+  // Fetch metadata
+  const email = await c.env.DB.prepare('SELECT * FROM emails WHERE id = ?').bind(id).first();
+  if (!email) return c.json({ error: 'Not found' }, 404);
+
   // Mark as read
   await c.env.DB.prepare('UPDATE emails SET is_read = 1 WHERE id = ?').bind(id).run();
   
-  return c.json(email);
+  // Try to fetch body from R2 (for full content), fallback to D1 or empty
+  let body_html = "";
+  try {
+    const r2Object = await c.env.MAIL_STORAGE.get(`raw/${id}`);
+    if (r2Object) {
+      const rawBuffer = await r2Object.arrayBuffer();
+      const parser = new PostalMime();
+      const parsed = await parser.parse(rawBuffer);
+      body_html = parsed.html || parsed.text || "";
+    }
+  } catch (e) {
+    console.warn("Could not fetch from R2, using fallback if available");
+  }
+
+  return c.json({ ...email, body_html });
 });
 
-// Send Email (Outbound)
+// Semantic Search
+app.post('/api/search', async (c) => {
+  const { query } = await c.req.json();
+  
+  // 1. Generate Embedding
+  const embedding = await c.env.AI.run('@cf/baai/bge-base-en-v1.5', { text: [query] });
+  
+  // 2. Query Vector Index
+  // @ts-ignore
+  const vectorResults = await c.env.VECTOR_INDEX.query(embedding.data[0], { topK: 10 });
+  const ids = vectorResults.matches.map(m => m.id);
+  
+  if (ids.length === 0) return c.json([]);
+  
+  // 3. Fetch Details from D1
+  const placeholders = ids.map(() => '?').join(',');
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM emails WHERE id IN (${placeholders})`
+  ).bind(...ids).all();
+  
+  return c.json(results);
+});
+
+// Send Email
 app.post('/api/send', async (c) => {
   const { to, subject, body } = await c.req.json();
-  
   try {
-    // Requires "Email Sending" enabled in Cloudflare Dashboard
     await c.env.EMAIL_SENDER.send({
       to: [{ email: to }],
-      from: { email: "me@yourdomain.com", name: "RavArch AI" }, // Must be a verified sender
+      from: { email: "me@yourdomain.com", name: "RavArch AI" },
       subject: subject,
-      content: [
-        { type: "text/plain", value: body }
-      ]
+      content: [{ type: "text/plain", value: body }]
     });
     return c.json({ success: true });
   } catch (e) {
@@ -56,77 +102,115 @@ app.post('/api/send', async (c) => {
   }
 });
 
-// --- 2. EMAIL HANDLER (Incoming Mail) ---
-
-async function processEmail(message: ForwardableEmailMessage, env: Env) {
-  const parser = new PostalMime();
-  const rawEmail = await new Response(message.raw).arrayBuffer();
-  const parsed = await parser.parse(rawEmail);
-
-  // 1. Extract Text
-  const bodyText = parsed.text || parsed.html || "";
-  const cleanBody = bodyText.slice(0, 4000); // Truncate for AI context window
-
-  // 2. AI Analysis Pipeline
-  const aiPrompt = `
-    Analyze this email. Return a JSON object with:
-    1. "summary": A single sentence summary (max 20 words).
-    2. "category": One of ["Work", "Personal", "Urgent", "Newsletter", "Spam"].
-    3. "sentiment": A float between -1.0 (Negative) and 1.0 (Positive).
-    4. "action_items": An array of strings describing required tasks (if any).
-    5. "suggested_reply": A professional, brief draft reply.
-
-    Email Subject: ${parsed.subject}
-    Email Body: ${cleanBody}
-  `;
-
-  let aiData = { summary: "Processing...", category: "Inbox", sentiment: 0, action_items: [], suggested_reply: "" };
-  
-  try {
-    const aiResponse = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-      messages: [{ role: 'user', content: aiPrompt }],
-      response_format: { type: 'json_object' } // Force JSON output
-    });
-    
-    // @ts-ignore
-    aiData = JSON.parse(aiResponse.response || "{}");
-  } catch (e) {
-    console.error("AI Analysis failed:", e);
-  }
-
-  // 3. Store in Vault (D1)
-  const id = crypto.randomUUID();
-  await env.DB.prepare(`
-    INSERT INTO emails (
-      id, sender_name, sender_address, recipient_address, subject, 
-      body_text, body_html, received_at, summary, category, 
-      sentiment_score, action_items, suggested_reply
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    id, 
-    parsed.from.name, 
-    parsed.from.address, 
-    parsed.to[0].address, 
-    parsed.subject,
-    parsed.text,
-    parsed.html,
-    Date.now(),
-    aiData.summary,
-    aiData.category,
-    aiData.sentiment || 0,
-    JSON.stringify(aiData.action_items || []),
-    aiData.suggested_reply
-  ).run();
-}
+// --- 2. WORKER HANDLERS ---
 
 export default {
   // HTTP Handler (API)
   fetch: app.fetch,
 
-  // Email Handler (SMTP)
+  // EMAIL HANDLER (The Sentinel)
+  // Accepts email, saves raw, and pushes to queue. Fast & Lightweight.
   async email(message, env, ctx) {
-    await processEmail(message, env);
-    // Optional: Forward to a backup address
-    // await message.forward("backup@gmail.com");
+    const id = crypto.randomUUID();
+    const rawBuffer = await new Response(message.raw).arrayBuffer();
+    
+    // 1. Store Raw immediately to R2 (Safekeeping)
+    await env.MAIL_STORAGE.put(`raw/${id}`, rawBuffer);
+
+    // 2. Offload Processing to Queue
+    // We encode to Base64 to pass securely through the Queue
+    const rawBase64 = btoa(String.fromCharCode(...new Uint8Array(rawBuffer)));
+    
+    await env.QUEUE.send({ 
+      id, 
+      raw: rawBase64, 
+      from: message.from, 
+      to: message.to 
+    });
+  },
+
+  // QUEUE HANDLER (The Brain)
+  // Processes heavy AI tasks without timing out the Email request.
+  async queue(batch, env) {
+    for (const msg of batch.messages) {
+      const job = msg.body as EmailJob;
+      
+      try {
+        const parser = new PostalMime();
+        // Decode raw email from Base64
+        const rawString = atob(job.raw);
+        const parsed = await parser.parse(rawString);
+
+        // A. Extract Text for AI
+        const bodyText = parsed.text || parsed.html || "";
+        const cleanBody = bodyText.slice(0, 4000); 
+
+        // B. AI Analysis (Llama 3.1)
+        const systemPrompt = `
+          Analyze this email. Return JSON:
+          {
+            "summary": "1 sentence summary",
+            "category": "Work|Personal|Finance|Urgent|Spam",
+            "sentiment": 0.0,
+            "action_items": ["item1", "item2"],
+            "suggested_reply": "draft reply"
+          }
+        `;
+        
+        const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Subject: ${parsed.subject}\n\n${cleanBody}` }
+          ],
+          response_format: { type: 'json_object' }
+        });
+
+        // @ts-ignore
+        const aiData = JSON.parse(aiRes.response || "{}");
+
+        // C. Generate Embedding (for Search)
+        const vecRes = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+          text: [`Subject: ${parsed.subject} \n ${cleanBody}`]
+        });
+
+        // D. Save to Vectorize
+        await env.VECTOR_INDEX.upsert([{
+          id: job.id,
+          values: vecRes.data[0],
+          metadata: { category: aiData.category }
+        }]);
+
+        // E. Save to D1
+        await env.DB.prepare(`
+          INSERT INTO emails (
+            id, sender_name, sender_address, recipient_address, subject, 
+            body_text, body_html, received_at, summary, category, 
+            sentiment_score, action_items, suggested_reply
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          job.id, 
+          parsed.from.name, 
+          parsed.from.address, 
+          job.to, 
+          parsed.subject,
+          parsed.text,
+          parsed.html,
+          Date.now(),
+          aiData.summary,
+          aiData.category,
+          aiData.sentiment || 0,
+          JSON.stringify(aiData.action_items || []),
+          aiData.suggested_reply
+        ).run();
+
+        // Acknowledge success
+        msg.ack();
+
+      } catch (err) {
+        console.error("Queue Processing Failed:", err);
+        // Retrying can cause loops if error is permanent, so be careful
+        // msg.retry(); 
+      }
+    }
   }
 } satisfies ExportedHandler<Env>;
