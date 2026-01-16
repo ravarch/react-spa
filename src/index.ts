@@ -26,7 +26,7 @@ interface EmailJob {
   userId: string;
   to: string;
   from: string;
-  raw: string; // Base64 encoded
+  raw: string;
 }
 
 type Variables = {
@@ -68,22 +68,33 @@ app.use('/api/*', async (c, next) => {
 
 // --- ROUTES ---
 
-// 1. Auth
-app.post('/api/auth/register', async (c) => {
-  const { username, password } = await c.req.json();
+// 1. Auth & Auto-Provisioning
+app.post('/api/auth/guest', async (c) => {
+  // Generate random credentials
   const id = crypto.randomUUID();
+  const randomSuffix = crypto.randomUUID().split('-')[0];
+  const username = `user_${randomSuffix}`; // e.g. user_a1b2c3d4
+  const password = crypto.randomUUID(); // Random strong password (user doesn't need to know it)
   const salt = crypto.randomUUID();
   const hash = await hashPassword(password, salt);
 
   try {
+    // 1. Create User
     await c.env.DB.prepare('INSERT INTO users (id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)')
       .bind(id, username, hash, salt, Date.now()).run();
-    // Create default alias
+    
+    // 2. Create Default Alias (Auto-Email)
+    const address = `${username}@${c.env.DOMAIN}`;
     await c.env.DB.prepare('INSERT INTO aliases (address, user_id, name) VALUES (?, ?, ?)')
-      .bind(`${username}@${c.env.DOMAIN}`, id, username).run();
-    return c.json({ success: true });
+      .bind(address, id, 'My Inbox').run();
+
+    // 3. Issue Token
+    const token = await sign({ id, username, exp: Math.floor(Date.now()/1000) + (86400 * 30) }, c.env.JWT_SECRET); // 30 Day Token
+    
+    return c.json({ token, user: { id, username }, address });
   } catch (e) {
-    return c.json({ error: "Username taken or invalid data" }, 409);
+    console.error("Guest Creation Error", e);
+    return c.json({ error: "Failed to provision temporary inbox" }, 500);
   }
 });
 
@@ -114,7 +125,6 @@ app.get('/api/usage', async (c) => {
 
 app.get('/api/emails', async (c) => {
   const userId = c.get('user').id;
-  // Included has_attachments in query
   const { results } = await c.env.DB.prepare('SELECT * FROM emails WHERE user_id = ? ORDER BY received_at DESC LIMIT 50').bind(userId).all();
   return c.json(results);
 });
@@ -158,7 +168,7 @@ app.post('/api/send', async (c) => {
 export default {
   fetch: app.fetch,
 
-  // 1. INGESTION (SMTP)
+  // 1. INGESTION
   async email(message, env, ctx) {
     const alias = await env.DB.prepare('SELECT user_id FROM aliases WHERE address = ?').bind(message.to).first<{ user_id: string }>();
     if (!alias) {
@@ -168,36 +178,24 @@ export default {
 
     const userId = alias.user_id;
 
-    // --- FORWARDING RULES LOGIC ---
+    // Forwarding Logic
     try {
       const { results: rules } = await env.DB.prepare("SELECT * FROM forwarding_rules WHERE user_id = ? AND active = 1").bind(userId).all<any>();
       for (const rule of rules) {
         let shouldForward = false;
         if (rule.condition_type === 'all') shouldForward = true;
         else if (rule.condition_type === 'sender' && message.from.includes(rule.condition_value)) shouldForward = true;
-        else if (rule.condition_type === 'subject') {
-           // Subject isn't easily available in 'email' handler without parsing, 
-           // usually handled in processing or simplified here. 
-           // For high scale, we might skip subject checks here or parse headers partially.
-           shouldForward = true; 
-        }
 
-        if (shouldForward) {
-          await message.forward(rule.forward_to);
-        }
+        if (shouldForward) await message.forward(rule.forward_to);
       }
     } catch (e) { console.error("Forwarding failed", e); }
-    // ------------------------------
 
     const id = crypto.randomUUID();
     const rawBuffer = await new Response(message.raw).arrayBuffer();
     
     await env.MAIL_STORAGE.put(`raw/${id}`, rawBuffer);
 
-    env.USAGE_ANALYTICS.writeDataPoint({
-      blobs: ["ingest", userId],
-      doubles: [rawBuffer.byteLength]
-    });
+    env.USAGE_ANALYTICS.writeDataPoint({ blobs: ["ingest", userId], doubles: [rawBuffer.byteLength] });
 
     await env.QUEUE.send({ 
       id, userId, to: message.to, from: message.from, 
@@ -205,13 +203,12 @@ export default {
     });
   },
 
-  // 2. PROCESSING (Queue)
+  // 2. PROCESSING
   async queue(batch, env) {
     if (batch.queue === 'mail-dlq') return;
 
     const results = await Promise.allSettled(batch.messages.map(async (msg) => {
       const job = msg.body as EmailJob;
-      
       try {
         const parser = new PostalMime();
         const raw = Uint8Array.from(atob(job.raw), c => c.charCodeAt(0));
@@ -223,7 +220,7 @@ export default {
           const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
             messages: [{ 
               role: 'user', 
-              content: `Analyze email. JSON only: { "summary": "string", "category": "Work|Personal|Spam|Finance", "sentiment": 0.5 }. Subject: ${parsed.subject}\n\nBody: ${text}` 
+              content: `Analyze email. JSON: { "summary": "string", "category": "Work|Personal|Spam|Finance", "sentiment": 0.5 }. Subject: ${parsed.subject}\n\nBody: ${text}` 
             }],
             response_format: { type: 'json_object' }
           });
@@ -231,7 +228,7 @@ export default {
           aiData = JSON.parse(aiRes.response);
         } catch (e) { console.warn("AI Fail", e); }
 
-        // --- ATTACHMENT PROCESSING ---
+        // Attachments
         let hasAttachments = 0;
         if (parsed.attachments && parsed.attachments.length > 0) {
            hasAttachments = 1;
@@ -239,14 +236,9 @@ export default {
              const attId = crypto.randomUUID();
              const key = `attachments/${job.id}/${attId}`;
              await env.MAIL_STORAGE.put(key, att.content);
-             
-             await env.DB.prepare(`
-               INSERT INTO attachments (id, email_id, filename, content_type, size, r2_key, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-             `).bind(attId, job.id, att.filename, att.mimeType, att.content.byteLength, key, Date.now()).run();
+             await env.DB.prepare(`INSERT INTO attachments (id, email_id, filename, content_type, size, r2_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(attId, job.id, att.filename, att.mimeType, att.content.byteLength, key, Date.now()).run();
            }
         }
-        // -----------------------------
 
         await env.DB.prepare(`
           INSERT INTO emails (id, user_id, sender_address, subject, summary, category, sentiment_score, received_at, has_attachments)
@@ -261,10 +253,9 @@ export default {
     }));
   },
 
-  // 3. SCHEDULING (Cron)
+  // 3. SCHEDULING
   async scheduled(event, env, ctx) {
     const { results } = await env.DB.prepare("SELECT * FROM scheduled_emails WHERE status = 'pending' AND scheduled_for <= ?").bind(Date.now()).all<any>();
-    
     for (const task of results) {
       try {
         const msg = createMimeMessage();
@@ -272,10 +263,7 @@ export default {
         msg.setRecipient(task.to_address);
         msg.setSubject(task.subject);
         msg.addMessage({ contentType: 'text/html', data: task.body_html });
-
-        const message = new EmailMessage(task.from_address, task.to_address, msg.asRaw());
-        await env.EMAIL_SENDER.send(message);
-
+        await env.EMAIL_SENDER.send(new EmailMessage(task.from_address, task.to_address, msg.asRaw()));
         await env.DB.prepare("UPDATE scheduled_emails SET status = 'sent' WHERE id = ?").bind(task.id).run();
       } catch (e) {
         await env.DB.prepare("UPDATE scheduled_emails SET status = 'failed' WHERE id = ?").bind(task.id).run();
