@@ -1,4 +1,3 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
 import PostalMime from 'postal-mime';
 import { createMimeMessage } from 'mimetext';
 import { Hono } from 'hono';
@@ -70,11 +69,10 @@ app.use('/api/*', async (c, next) => {
 
 // 1. Auth & Auto-Provisioning
 app.post('/api/auth/guest', async (c) => {
-  // Generate random credentials
   const id = crypto.randomUUID();
   const randomSuffix = crypto.randomUUID().split('-')[0];
-  const username = `user_${randomSuffix}`; // e.g. user_a1b2c3d4
-  const password = crypto.randomUUID(); // Random strong password (user doesn't need to know it)
+  const username = `user_${randomSuffix}`; 
+  const password = crypto.randomUUID().slice(0, 12); // Shorter, readable password
   const salt = crypto.randomUUID();
   const hash = await hashPassword(password, salt);
 
@@ -83,15 +81,16 @@ app.post('/api/auth/guest', async (c) => {
     await c.env.DB.prepare('INSERT INTO users (id, username, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?)')
       .bind(id, username, hash, salt, Date.now()).run();
     
-    // 2. Create Default Alias (Auto-Email)
+    // 2. Create Default Alias
     const address = `${username}@${c.env.DOMAIN}`;
     await c.env.DB.prepare('INSERT INTO aliases (address, user_id, name) VALUES (?, ?, ?)')
       .bind(address, id, 'My Inbox').run();
 
     // 3. Issue Token
-    const token = await sign({ id, username, exp: Math.floor(Date.now()/1000) + (86400 * 30) }, c.env.JWT_SECRET); // 30 Day Token
+    const token = await sign({ id, username, exp: Math.floor(Date.now()/1000) + (86400 * 30) }, c.env.JWT_SECRET);
     
-    return c.json({ token, user: { id, username }, address });
+    // RETURN PASSWORD so user can save it!
+    return c.json({ token, user: { id, username }, address, generatedPassword: password });
   } catch (e) {
     console.error("Guest Creation Error", e);
     return c.json({ error: "Failed to provision temporary inbox" }, 500);
@@ -107,7 +106,7 @@ app.post('/api/auth/login', async (c) => {
   const hash = await hashPassword(password, user.salt);
   if (hash !== user.password_hash) return c.json({ error: "Invalid credentials" }, 401);
 
-  const token = await sign({ id: user.id, username: user.username, exp: Math.floor(Date.now()/1000) + 86400 }, c.env.JWT_SECRET);
+  const token = await sign({ id: user.id, username: user.username, exp: Math.floor(Date.now()/1000) + (86400 * 30) }, c.env.JWT_SECRET);
   return c.json({ token, user: { id: user.id, username: user.username } });
 });
 
@@ -217,15 +216,18 @@ export default {
 
         let aiData = { category: 'Inbox', sentiment: 0, summary: 'No summary' };
         try {
-          const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
-            messages: [{ 
-              role: 'user', 
-              content: `Analyze email. JSON: { "summary": "string", "category": "Work|Personal|Spam|Finance", "sentiment": 0.5 }. Subject: ${parsed.subject}\n\nBody: ${text}` 
-            }],
-            response_format: { type: 'json_object' }
-          });
-          // @ts-ignore
-          aiData = JSON.parse(aiRes.response);
+          // Check if AI binding exists before calling
+          if (env.AI) {
+              const aiRes = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+                messages: [{ 
+                  role: 'user', 
+                  content: `Analyze email. JSON: { "summary": "string", "category": "Work|Personal|Spam|Finance", "sentiment": 0.5 }. Subject: ${parsed.subject}\n\nBody: ${text}` 
+                }],
+                response_format: { type: 'json_object' }
+              });
+              // @ts-ignore
+              aiData = JSON.parse(aiRes.response);
+          }
         } catch (e) { console.warn("AI Fail", e); }
 
         // Attachments
@@ -241,8 +243,8 @@ export default {
         }
 
         await env.DB.prepare(`
-          INSERT INTO emails (id, user_id, sender_address, subject, summary, category, sentiment_score, received_at, has_attachments)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO emails (id, user_id, sender_address, subject, summary, category, sentiment_score, received_at, has_attachments, is_read)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         `).bind(job.id, job.userId, parsed.from.address, parsed.subject, aiData.summary, aiData.category, aiData.sentiment, Date.now(), hasAttachments).run();
 
         msg.ack();
