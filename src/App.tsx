@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { 
-  Inbox, Send, Plus, Activity, X, LogOut, Loader2, Calendar, Paperclip, Copy
+  Inbox, Send, Plus, Activity, X, LogOut, Loader2, Calendar, Paperclip, Copy, Shield, Key
 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { TelegramBanner } from './components/TelegramBanner';
@@ -29,38 +29,145 @@ const useAuth = () => {
 // --- MAIN APP ---
 export default function App() {
   const { token, user, login, logout } = useAuth();
-  const [isProvisioning, setIsProvisioning] = useState(false);
+  
+  if (token && user) {
+    return <Dashboard token={token} user={user} onLogout={logout} />;
+  }
 
-  // AUTO-CREATE GUEST ACCOUNT IF NO TOKEN
-  useEffect(() => {
-    if (!token && !isProvisioning) {
-      setIsProvisioning(true);
-      fetch('/api/auth/guest', { method: 'POST' })
-        .then(res => res.json())
-        .then(data => {
-          if (data.token) login(data.token, data.user);
-        })
-        .catch(err => console.error("Provisioning failed", err))
-        .finally(() => setIsProvisioning(false));
+  return <AuthScreen onLogin={login} />;
+}
+
+// --- AUTH SCREENS ---
+function AuthScreen({ onLogin }: { onLogin: (t: string, u: User) => void }) {
+  const [mode, setMode] = useState<'welcome' | 'login'>('welcome');
+  const [loading, setLoading] = useState(false);
+  const [newCreds, setNewCreds] = useState<{username:string, password:string} | null>(null);
+  
+  // Login Form State
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+
+  const createGuest = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch('/api/auth/guest', { method: 'POST' });
+      const data = await res.json();
+      if (data.token) {
+        // Don't auto-login immediately; show credentials first
+        setNewCreds({ username: data.user.username, password: data.generatedPassword });
+        // Store temp for the "Continue" button
+        window.tempAuth = { token: data.token, user: data.user };
+      }
+    } catch (e) {
+      console.error(e);
+      setError("Failed to create inbox");
+    } finally {
+      setLoading(false);
     }
-  }, [token, isProvisioning]);
+  };
 
-  if (!token || !user) {
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+        const res = await fetch('/api/auth/login', { 
+            method: 'POST', 
+            body: JSON.stringify({ username, password }) 
+        });
+        const data = await res.json();
+        if (data.token) onLogin(data.token, data.user);
+        else setError(data.error || 'Login failed');
+    } catch {
+        setError("Network error");
+    } finally {
+        setLoading(false);
+    }
+  };
+
+  if (newCreds) {
     return (
-      <div className="min-h-screen bg-[#09090b] flex flex-col items-center justify-center text-white gap-6">
-        <Loader2 className="animate-spin text-indigo-500" size={48} />
-        <div className="text-center">
-          <h1 className="text-2xl font-bold mb-2">Generating Temporary Inbox</h1>
-          <p className="text-zinc-500">Assigning a secure, anonymous email address...</p>
+      <div className="min-h-screen bg-[#09090b] flex items-center justify-center p-4">
+        <div className="bg-[#1a1a1a] p-8 rounded-2xl border border-white/10 max-w-md w-full shadow-2xl">
+            <div className="flex justify-center mb-6"><div className="w-12 h-12 bg-green-500/20 text-green-500 rounded-full flex items-center justify-center"><Key size={24}/></div></div>
+            <h2 className="text-2xl font-bold text-white text-center mb-2">Inbox Created</h2>
+            <p className="text-zinc-400 text-center mb-6 text-sm">Save these credentials to access your inbox later.</p>
+            
+            <div className="bg-black/50 p-4 rounded-lg space-y-3 mb-6 border border-white/5">
+                <div className="flex justify-between items-center">
+                    <span className="text-zinc-500 text-sm">Username</span>
+                    <span className="text-white font-mono select-all">{newCreds.username}</span>
+                </div>
+                <div className="flex justify-between items-center">
+                    <span className="text-zinc-500 text-sm">Password</span>
+                    <span className="text-white font-mono select-all">{newCreds.password}</span>
+                </div>
+            </div>
+
+            <button 
+                onClick={() => onLogin(window.tempAuth.token, window.tempAuth.user)}
+                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl transition-colors"
+            >
+                Access Inbox
+            </button>
         </div>
       </div>
     );
   }
 
-  return <Dashboard token={token} user={user} onLogout={logout} />;
+  return (
+    <div className="min-h-screen bg-[#09090b] flex flex-col items-center justify-center text-white p-4 relative overflow-hidden">
+      {/* Background Elements */}
+      <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-indigo-900/20 via-[#09090b] to-[#09090b] -z-10"></div>
+      
+      <div className="w-full max-w-md">
+        <div className="text-center mb-8">
+            <div className="inline-block p-3 rounded-2xl bg-indigo-500/10 mb-4 border border-indigo-500/20">
+                <Shield className="text-indigo-400 w-8 h-8" />
+            </div>
+            <h1 className="text-4xl font-bold bg-clip-text text-transparent bg-gradient-to-b from-white to-zinc-400 mb-2">RavArch</h1>
+            <p className="text-zinc-500">Secure, ephemeral, AI-powered email.</p>
+        </div>
+
+        {mode === 'welcome' ? (
+             <div className="space-y-4">
+                <button onClick={createGuest} disabled={loading} className="w-full bg-white text-black hover:bg-zinc-200 font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 transition-colors">
+                    {loading ? <Loader2 className="animate-spin"/> : <Plus size={20}/>}
+                    Create Temporary Inbox
+                </button>
+                <button onClick={() => setMode('login')} className="w-full bg-zinc-800 hover:bg-zinc-700 text-white font-medium py-3.5 rounded-xl border border-white/5 transition-colors">
+                    Login to Existing
+                </button>
+             </div>
+        ) : (
+            <form onSubmit={handleLogin} className="space-y-4 bg-[#1a1a1a] p-6 rounded-2xl border border-white/10">
+                {error && <div className="text-red-400 text-sm text-center bg-red-500/10 p-2 rounded">{error}</div>}
+                <div>
+                    <label className="text-xs text-zinc-500 uppercase font-bold tracking-wider ml-1">Username</label>
+                    <input value={username} onChange={e=>setUsername(e.target.value)} className="w-full bg-black/50 border border-white/10 rounded-lg px-4 py-3 mt-1 text-white focus:border-indigo-500 outline-none transition-colors" placeholder="user_..." />
+                </div>
+                <div>
+                    <label className="text-xs text-zinc-500 uppercase font-bold tracking-wider ml-1">Password</label>
+                    <input type="password" value={password} onChange={e=>setPassword(e.target.value)} className="w-full bg-black/50 border border-white/10 rounded-lg px-4 py-3 mt-1 text-white focus:border-indigo-500 outline-none transition-colors" placeholder="••••••••" />
+                </div>
+                <button type="submit" disabled={loading} className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-lg mt-2 transition-colors flex justify-center">
+                    {loading ? <Loader2 className="animate-spin"/> : 'Login'}
+                </button>
+                <button type="button" onClick={() => setMode('welcome')} className="w-full text-zinc-500 text-sm hover:text-zinc-300">Cancel</button>
+            </form>
+        )}
+      </div>
+      
+      <div className="mt-12 opacity-80 scale-75">
+         <TelegramBanner />
+      </div>
+    </div>
+  );
 }
 
-// --- DASHBOARD ---
+declare global { interface Window { tempAuth: any; } }
+
+// --- DASHBOARD (Unchanged mostly, just ensure usage) ---
 function Dashboard({ token, user, onLogout }: { token: string, user: User, onLogout: () => void }) {
   const [view, setView] = useState('inbox');
   const [showUsage, setShowUsage] = useState(false);
@@ -81,7 +188,6 @@ function Dashboard({ token, user, onLogout }: { token: string, user: User, onLog
 
   const copyAddress = () => {
     navigator.clipboard.writeText(currentAlias);
-    // Could add toast here
   };
 
   return (
@@ -89,7 +195,6 @@ function Dashboard({ token, user, onLogout }: { token: string, user: User, onLog
       <aside className="w-64 bg-[#0c0c0e] border-r border-white/5 flex flex-col p-4 hidden md:flex">
         <div className="font-bold mb-8 text-xl px-2 text-indigo-400">RavArch</div>
         
-        {/* Quick Copy Section */}
         <div className="mb-6 bg-zinc-900 border border-white/10 rounded-lg p-3">
             <div className="text-xs text-zinc-500 mb-1 uppercase tracking-wider">Your Address</div>
             <div className="flex items-center gap-2 text-sm font-mono text-white truncate mb-2">
@@ -109,7 +214,7 @@ function Dashboard({ token, user, onLogout }: { token: string, user: User, onLog
         
         <div className="mt-4 pt-4 border-t border-white/5">
            <button onClick={() => setShowUsage(true)} className="w-full flex items-center gap-2 px-3 py-2 text-zinc-500 hover:text-white text-sm transition-colors"><Activity size={16}/> Usage</button>
-           <button onClick={onLogout} className="w-full flex items-center gap-2 px-3 py-2 text-zinc-500 hover:text-red-400 text-sm transition-colors"><LogOut size={16}/> New Identity</button>
+           <button onClick={onLogout} className="w-full flex items-center gap-2 px-3 py-2 text-zinc-500 hover:text-red-400 text-sm transition-colors"><LogOut size={16}/> Logout</button>
         </div>
       </aside>
 
@@ -117,7 +222,7 @@ function Dashboard({ token, user, onLogout }: { token: string, user: User, onLog
         {view === 'inbox' ? <InboxView token={token} /> : <Composer token={token} from={currentAlias} close={() => setView('inbox')} />}
         {showUsage && <UsageModal token={token} close={() => setShowUsage(false)} />}
         <div className="absolute bottom-4 right-4">
-             <TelegramBanner />
+             {/* Removed banner from dashboard to keep it clean, added to Auth screen */}
         </div>
       </main>
     </div>
