@@ -26,39 +26,12 @@
     }
   ],
 
-  "vectorize": [
-    {
-      "binding": "VECTOR_INDEX",
-      "index_name": "drkingbd"
-    }
-  ],
-
   "analytics_engine_datasets": [
     {
       "binding": "USAGE_ANALYTICS",
       "dataset": "mail_usage_events"
     }
   ],
-
-  "queues": {
-    "producers": [
-      { "queue": "email-processing-queue", "binding": "QUEUE" },
-      { "queue": "mail-dlq", "binding": "DLQ" }
-    ],
-    "consumers": [
-      { 
-        "queue": "email-processing-queue", 
-        "max_batch_size": 20,
-        "max_batch_timeout": 5,
-        "max_retries": 5,
-        "dead_letter_queue": "mail-dlq"
-      }
-    ]
-  },
-
-  "triggers": {
-    "crons": ["* * * * *"]
-  },
 
   "ai": { "binding": "AI" },
   "send_email": [{ "name": "EMAIL_SENDER" }],
