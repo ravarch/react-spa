@@ -41,7 +41,7 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_classes": ["Mailbox"]
+      "new_sqlite_classes": ["Mailbox"]
     }
   ],
 
