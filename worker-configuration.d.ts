@@ -6,7 +6,15 @@ declare namespace Cloudflare {
 		mainModule: typeof import("./src/index");
 	}
 	interface Env {
-	}
+	ASSETS: Fetcher;
+	DB: D1Database;
+	MAIL_STORAGE: R2Bucket;
+	AI: Ai;
+	EMAIL_SENDER: SendEmail;
+	MAILBOX_DO: DurableObjectNamespace;
+	DOMAIN: string;
+	JWT_SECRET: string;
+}
 }
 interface Env extends Cloudflare.Env {}
 
