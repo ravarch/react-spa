@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "ai-temp-mail",
+  "name": "react-spa",
   "main": "src/index.ts",
   "compatibility_date": "2024-09-23",
   "compatibility_flags": ["nodejs_compat"],
@@ -15,8 +15,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "mail-db",
-      "database_id": "YOUR_D1_DATABASE_ID"
+      "database_name": "saas-db-prod",
+      "database_id": "4d34b41b-d77d-452b-8aab-c531bdfebd6d"
     }
   ],
 
@@ -58,6 +58,6 @@
 
   "vars": {
     "DOMAIN": "drkingbd.cc",
-    "JWT_SECRET": "replace-with-secure-random-string"
+    "JWT_SECRET": "svpm9w9YE6KANc38yuVcAyQIcDFCpUnhmn1casTmxL7"
   }
 }
