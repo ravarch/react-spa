@@ -5,23 +5,22 @@ import PostalMime from 'postal-mime';
 import { EmailMessage } from 'cloudflare:email';
 import { createMimeMessage } from 'mimetext';
 
-// --- Durable Object for Real-time WebSockets ---
+// --- Durable Object: Real-time Mailbox ---
 export class Mailbox extends DurableObject<Env> {
-	sessions = new Map<WebSocket, any>();
+	sessions = new Set<WebSocket>();
 
 	async fetch(request: Request) {
 		if (request.url.endsWith('/websocket')) {
 			const upgradeHeader = request.headers.get('Upgrade');
 			if (!upgradeHeader || upgradeHeader !== 'websocket') {
-				return new Response('Durable Object expected Upgrade: websocket', { status: 426 });
+				return new Response('Expected Upgrade: websocket', { status: 426 });
 			}
 
 			const webSocketPair = new WebSocketPair();
 			const [client, server] = Object.values(webSocketPair);
 
-			// Hibernate-ready WebSocket acceptance
 			this.ctx.acceptWebSocket(server);
-			this.sessions.set(server, {});
+			this.sessions.add(server);
 
 			return new Response(null, {
 				status: 101,
@@ -31,24 +30,28 @@ export class Mailbox extends DurableObject<Env> {
 		return new Response('Mailbox DO Active', { status: 200 });
 	}
 
-	async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-		// Handle incoming messages from client if needed (e.g. "ping")
+	async webSocketMessage(ws: WebSocket, message: string) {
+		// Handle client messages if needed (e.g. "ping")
 	}
 
-	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+	async webSocketClose(ws: WebSocket) {
 		this.sessions.delete(ws);
 	}
 
-	// Triggered by the Worker when a new email arrives
+	// Method called by the Worker when new email arrives
 	async broadcastEmail(emailData: any) {
 		const message = JSON.stringify({ type: 'NEW_EMAIL', data: emailData });
 		this.ctx.getWebSockets().forEach((ws) => {
-			ws.send(message);
+			try {
+				ws.send(message);
+			} catch (e) {
+				// Handle disconnected sockets
+			}
 		});
 	}
 }
 
-// --- Main Worker Logic ---
+// --- Hono API ---
 const app = new Hono<{ Bindings: Env }>();
 
 app.use('/api/*', cors());
@@ -56,7 +59,7 @@ app.use('/api/*', cors());
 // 1. Generate New Identity
 app.post('/api/generate', async (c) => {
 	const username = Math.random().toString(36).substring(2, 10);
-	const password = Math.random().toString(36).substring(2, 12);
+	const password = crypto.randomUUID().substring(0, 12); // Stronger auto-gen password
 	const address = `${username}@${c.env.DOMAIN}`;
 
 	await c.env.DB.prepare('INSERT INTO users (username, password) VALUES (?, ?)')
@@ -66,7 +69,7 @@ app.post('/api/generate', async (c) => {
 	return c.json({ username, address, password });
 });
 
-// 2. Login / Get Token
+// 2. Login (for returning users)
 app.post('/api/login', async (c) => {
 	const { username, password } = await c.req.json();
 	const user = await c.env.DB.prepare('SELECT * FROM users WHERE username = ? AND password = ?')
@@ -74,23 +77,21 @@ app.post('/api/login', async (c) => {
 		.first();
 
 	if (!user) return c.json({ error: 'Invalid credentials' }, 401);
-	
-	// In production, sign a real JWT here
-	return c.json({ success: true, username });
+	return c.json({ success: true, username, address: `${username}@${c.env.DOMAIN}` });
 });
 
 // 3. List Emails
 app.get('/api/emails/:username', async (c) => {
 	const username = c.req.param('username');
 	const { results } = await c.env.DB.prepare(
-		'SELECT id, sender, subject, snippet, has_attachments, is_read, created_at FROM emails WHERE username = ? ORDER BY created_at DESC'
+		'SELECT id, sender, subject, snippet, has_attachments, is_read, ai_summary, created_at FROM emails WHERE username = ? ORDER BY created_at DESC'
 	)
 		.bind(username)
 		.all();
 	return c.json(results);
 });
 
-// 4. Get Email Detail (Raw Content + AI Summary)
+// 4. Get Email Detail
 app.get('/api/email/:id', async (c) => {
 	const id = c.req.param('id');
 	const meta = await c.env.DB.prepare('SELECT * FROM emails WHERE id = ?').bind(id).first();
@@ -114,16 +115,13 @@ app.get('/api/email/:id', async (c) => {
 
 // 5. Reply to Email
 app.post('/api/reply', async (c) => {
-	const { username, replyTo, subject, body, originalMessageId } = await c.req.json();
+	const { username, replyTo, subject, body } = await c.req.json();
 	
 	const msg = createMimeMessage();
 	msg.setSender({ name: username, addr: `${username}@${c.env.DOMAIN}` });
 	msg.setRecipient(replyTo);
 	msg.setSubject(`Re: ${subject}`);
 	msg.addMessage({ contentType: 'text/plain', data: body });
-	if (originalMessageId) {
-		msg.setHeader('In-Reply-To', originalMessageId);
-	}
 
 	const emailMessage = new EmailMessage(
 		`${username}@${c.env.DOMAIN}`,
@@ -139,7 +137,7 @@ app.post('/api/reply', async (c) => {
 	}
 });
 
-// 6. WebSocket Upgrade
+// 6. WebSocket Upgrade Route
 app.get('/api/ws', async (c) => {
 	const username = c.req.query('username');
 	if (!username) return c.text('Missing username', 400);
@@ -150,10 +148,11 @@ app.get('/api/ws', async (c) => {
 	return stub.fetch(c.req.raw);
 });
 
-// --- Email Routing Handler ---
+// --- Worker Export ---
 export default {
-	...app, // Export Hono handlers for HTTP
+	...app, // API handlers
 
+	// Email Handler (Cloudflare Email Routing)
 	async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext) {
 		const parser = new PostalMime();
 		const rawEmail = await new Response(message.raw).arrayBuffer();
@@ -161,16 +160,22 @@ export default {
 
 		const toAddress = message.to;
 		const username = toAddress.split('@')[0];
+		
+		// Validate user exists
+		const user = await env.DB.prepare('SELECT 1 FROM users WHERE username = ?').bind(username).first();
+		if (!user) {
+			message.setReject("User does not exist");
+			return;
+		}
+
 		const emailId = crypto.randomUUID();
 		const r2Key = `${username}/${emailId}.json`;
 
-		// 1. AI Analysis & Summary
-		let aiSummary = "No summary available.";
+		// 1. AI Analysis
+		let aiSummary = "Processing AI summary...";
 		try {
-			const prompt = `Summarize the following email in 2 sentences. 
-			Sender: ${parsed.from.address}
-			Subject: ${parsed.subject}
-			Body: ${parsed.text?.substring(0, 1000) || parsed.html?.substring(0, 1000) || ""}`;
+			const textBody = parsed.text?.substring(0, 1500) || parsed.html?.substring(0, 1500) || "";
+			const prompt = `Analyze this email. Provide a brief 2-sentence summary and list any attachment types if mentioned. Email: ${textBody}`;
 			
 			const aiRes = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
 				messages: [{ role: 'user', content: prompt }]
@@ -178,13 +183,14 @@ export default {
 			
 			if (aiRes?.response) aiSummary = aiRes.response;
 		} catch (e) {
-			console.error("AI Summary failed", e);
+			console.error("AI Error:", e);
+			aiSummary = "AI Summary unavailable.";
 		}
 
-		// 2. Store Raw Data in R2
+		// 2. Store Data
+		// We store the parsed JSON in R2 for easy frontend rendering without re-parsing
 		await env.MAIL_STORAGE.put(r2Key, JSON.stringify(parsed));
 
-		// 3. Store Metadata in D1
 		await env.DB.prepare(
 			`INSERT INTO emails (id, username, sender, subject, snippet, raw_r2_key, has_attachments, ai_summary) 
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -193,34 +199,27 @@ export default {
 			username,
 			parsed.from.address,
 			parsed.subject || "(No Subject)",
-			(parsed.text || "").substring(0, 100),
+			(parsed.text || "").substring(0, 150),
 			r2Key,
 			parsed.attachments && parsed.attachments.length > 0 ? 1 : 0,
 			aiSummary
 		).run();
 
-		// 4. Notify Durable Object (Real-time update)
+		// 3. Notify Durable Object (Real-time)
 		const doId = env.MAILBOX_DO.idFromName(username);
 		const stub = env.MAILBOX_DO.get(doId);
-		// We add a custom method to the DO class or just abuse fetch for signaling
-		// Ideally we use a specific RPC method if using new RPC, but simple fetch works for now.
-		// Since we defined broadcastEmail in the class, we can cast the stub if using RPC, 
-		// but standard fetch is safer for generic workers setup.
-		// Let's use RPC call if using the new class-based system, but here we'll use a fetch trigger.
 		
-		// Note: To use RPC properly in the worker:
-		// await stub.broadcastEmail({...}) -> Requires 'durable_objects' binding to match class export
-		// For simplicity/compatibility, we can't easily RPC without `cloudflare:workers` specific typing setup in strict mode.
-		// We'll skip the explicit RPC call in this example and rely on polling or just assume the DO logic above.
-		// *Correction*: We can just implement the broadcast logic directly in the DO's fetch if we wanted, 
-		// but let's assume standard behavior: The client polls or we implement a proper internal RPC.
-		
-		// For this implementation, we will assume the DO is polling D1 or we send a "NEW_EMAIL" signal via fetch.
-		// Let's add a "webhook" style fetch to the DO.
-		
-		// Implementation of Internal Signal:
-		/* In a real-world RPC scenario:
-		   await stub.broadcastEmail({ id: emailId, ... });
-		*/
+		// Use RPC if configured, or simple fetch triggering
+		// Here we trigger the DO to broadcast via a fetch call or internal method if using RPC
+		// For compat, we won't use direct RPC syntax in this block without configuring it, so we rely on the DO instance knowing.
+		// Actually, let's just assume the client polls OR we add a specific 'internal' fetch endpoint to the DO.
+		// In a production RPC setup: await stub.broadcastEmail({...});
+		// Since we defined the class above, we can cast:
+		await (stub as any).broadcastEmail({
+			id: emailId,
+			sender: parsed.from.address,
+			subject: parsed.subject,
+			ai_summary: aiSummary
+		});
 	}
 };
